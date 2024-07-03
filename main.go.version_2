@@ -1,0 +1,276 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
+	"github.com/slack-go/slack"
+)
+
+var (
+	slackClient *slack.Client
+	channelID   string
+	redisClient *redis.Client
+	ctx         = context.Background()
+)
+
+const (
+	mergedTTL    = 7 * 24 * time.Hour
+	mrPrefix     = "mr:"
+	statusOpen   = "open"
+	statusMerged = "merged"
+)
+
+func init() {
+	// Настройка формата логирования
+	log.SetFlags(log.Ldate | log.Ltime)
+	log.SetPrefix("[APP] ")
+}
+
+func main() {
+	slackToken := os.Getenv("SLACK_BOT_TOKEN")
+	channelID = os.Getenv("SLACK_CHANNEL_ID")
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if slackToken == "" || channelID == "" || redisAddr == "" {
+		log.Fatal("SLACK_BOT_TOKEN, SLACK_CHANNEL_ID, and REDIS_ADDR must be set")
+	}
+
+	slackClient = slack.New(slackToken)
+
+	redisClient = redis.NewClient(&redis.Options{
+		Addr: redisAddr,
+	})
+
+	// Проверка подключения к Redis
+	_, err := redisClient.Ping(ctx).Result()
+	if err != nil {
+		log.Fatalf("Failed to connect to Redis: %v", err)
+	}
+
+	// Вывод статистики при запуске
+	activeCount, mergedCount, err := countMergeRequests()
+	if err != nil {
+		log.Printf("Error counting merge requests: %v", err)
+	} else {
+		log.Printf("Currently tracking %d active merge requests", activeCount)
+		log.Printf("%d merged merge requests will be cleaned up soon", mergedCount)
+	}
+
+	gin.SetMode(gin.DebugMode)
+	r := gin.New()
+	r.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
+		return fmt.Sprintf("[GIN] %s - %s %s %s %d %s %s\n",
+			param.TimeStamp.Format("2006/01/02 15:04:05"),
+			param.ClientIP,
+			param.Method,
+			param.Path,
+			param.StatusCode,
+			param.Latency,
+			param.ErrorMessage,
+		)
+	}))
+	r.Use(gin.Recovery())
+	r.POST("/gitlab-webhook", handleGitlabWebhook)
+	if err := r.Run(":8080"); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func handleGitlabWebhook(c *gin.Context) {
+	var data map[string]interface{}
+	if err := c.BindJSON(&data); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid JSON"})
+		return
+	}
+	objectKind, ok := data["object_kind"].(string)
+	if !ok {
+		c.JSON(400, gin.H{"error": "Missing object_kind"})
+		return
+	}
+	switch objectKind {
+	case "merge_request":
+		handleMergeRequest(data)
+	case "note":
+		handleComment(data)
+	}
+	c.JSON(200, gin.H{"status": "success"})
+}
+
+func handleMergeRequest(data map[string]interface{}) {
+	objectAttrs, ok := data["object_attributes"].(map[string]interface{})
+	if !ok {
+		log.Println("Invalid object_attributes")
+		return
+	}
+	action, _ := objectAttrs["action"].(string)
+	mrID, _ := objectAttrs["id"].(float64)
+	title, _ := objectAttrs["title"].(string)
+	url, _ := objectAttrs["url"].(string)
+	user, ok := data["user"].(map[string]interface{})
+	if !ok {
+		log.Println("Invalid user data")
+		return
+	}
+	author, _ := user["name"].(string)
+
+	key := fmt.Sprintf("%s%d", mrPrefix, int(mrID))
+
+	switch action {
+	case "open":
+		message := fmt.Sprintf("New MR opened: *%s* by %s\n%s", title, author, url)
+		ts, err := sendSlackMessage(message)
+		if err != nil {
+			log.Printf("Error sending Slack message: %v", err)
+			return
+		}
+		err = redisClient.Set(ctx, key, ts+"|"+statusOpen, 0).Err() // 0 means no expiration
+		if err != nil {
+			log.Printf("Error saving to Redis: %v", err)
+		} else {
+			log.Printf("Saved MR %d to Redis without TTL", int(mrID))
+		}
+	case "close":
+		updateMRStatus(int(mrID), fmt.Sprintf("MR closed by %s", author))
+	case "merge":
+		updateMRStatus(int(mrID), fmt.Sprintf("MR merged by %s", author))
+		// Обновляем TTL и статус для замерженного MR
+		err := redisClient.Set(ctx, key, redisClient.Get(ctx, key).Val()+"|"+statusMerged, mergedTTL).Err()
+		if err != nil {
+			log.Printf("Error updating merged MR in Redis: %v", err)
+		} else {
+			log.Printf("Updated MR %d in Redis with merged status and TTL %v", int(mrID), mergedTTL)
+		}
+	case "reopen":
+		updateMRStatus(int(mrID), fmt.Sprintf("MR reopened by %s", author))
+	}
+}
+
+func handleComment(data map[string]interface{}) {
+	objectAttrs, ok := data["object_attributes"].(map[string]interface{})
+	if !ok {
+		log.Println("Invalid object_attributes")
+		return
+	}
+	noteableType, _ := objectAttrs["noteable_type"].(string)
+	if noteableType != "MergeRequest" {
+		return
+	}
+	mrID, _ := objectAttrs["noteable_id"].(float64)
+	mrIID, _ := data["merge_request"].(map[string]interface{})["iid"].(float64)
+	note, _ := objectAttrs["note"].(string)
+	user, ok := data["user"].(map[string]interface{})
+	if !ok {
+		log.Println("Invalid user data")
+		return
+	}
+	author, _ := user["name"].(string)
+
+	// Check if it's a code comment
+	position, hasPosition := objectAttrs["position"].(map[string]interface{})
+	if hasPosition {
+		oldPath, _ := position["old_path"].(string)
+		newPath, _ := position["new_path"].(string)
+		oldLine, _ := position["old_line"].(float64)
+		newLine, _ := position["new_line"].(float64)
+
+		// Get the comment URL
+		project, _ := data["project"].(map[string]interface{})
+		projectURL, _ := project["web_url"].(string)
+		commentID, _ := objectAttrs["id"].(float64)
+		commentURL := fmt.Sprintf("%s/-/merge_requests/%d#note_%d", projectURL, int(mrIID), int(commentID))
+
+		commentInfo := fmt.Sprintf("Code comment by %s:\n", author)
+		if oldPath != "" && newPath != "" && oldPath != newPath {
+			commentInfo += fmt.Sprintf("File changed: %s -> %s\n", oldPath, newPath)
+		} else if newPath != "" {
+			commentInfo += fmt.Sprintf("File: %s\n", newPath)
+		}
+		if oldLine > 0 {
+			commentInfo += fmt.Sprintf("Old line: %d\n", int(oldLine))
+		}
+		if newLine > 0 {
+			commentInfo += fmt.Sprintf("Commented line: <%s|%d>\n", commentURL, int(newLine))
+		}
+		commentInfo += fmt.Sprintf("Comment: %s", note)
+
+		updateMRStatus(int(mrID), commentInfo)
+	} else {
+		// Regular MR comment
+		updateMRStatus(int(mrID), fmt.Sprintf("New comment by %s:\n%s", author, note))
+	}
+}
+
+func sendSlackMessage(message string) (string, error) {
+	msgOptions := []slack.MsgOption{
+		slack.MsgOptionText(message, false),
+	}
+	_, ts, err := slackClient.PostMessage(channelID, msgOptions...)
+	if err != nil {
+		log.Printf("Error sending Slack message: %v", err)
+		return "", err
+	}
+	log.Printf("Successfully sent message to Slack. Timestamp: %s", ts)
+	return ts, nil
+}
+
+func updateMRStatus(mrID int, message string) {
+	key := fmt.Sprintf("%s%d", mrPrefix, mrID)
+	value, err := redisClient.Get(ctx, key).Result()
+	if err != nil {
+		log.Printf("Error retrieving from Redis: %v", err)
+		return
+	}
+
+	parts := strings.Split(value, "|")
+	if len(parts) < 1 {
+		log.Printf("Invalid data format in Redis for MR %d", mrID)
+		return
+	}
+
+	ts := parts[0]
+
+	_, _, err = slackClient.PostMessage(
+		channelID,
+		slack.MsgOptionText(message, false),
+		slack.MsgOptionTS(ts),
+	)
+	if err != nil {
+		log.Printf("Error sending message in thread: %v", err)
+	}
+}
+
+func countMergeRequests() (int, int, error) {
+	var cursor uint64
+	var activeCount, mergedCount int
+	for {
+		var keys []string
+		var err error
+		keys, cursor, err = redisClient.Scan(ctx, cursor, mrPrefix+"*", 100).Result()
+		if err != nil {
+			return 0, 0, err
+		}
+		for _, key := range keys {
+			value, err := redisClient.Get(ctx, key).Result()
+			if err != nil {
+				log.Printf("Error getting value for key %s: %v", key, err)
+				continue
+			}
+			parts := strings.Split(value, "|")
+			if len(parts) > 1 && parts[1] == statusMerged {
+				mergedCount++
+			} else {
+				activeCount++
+			}
+		}
+		if cursor == 0 {
+			break
+		}
+	}
+	return activeCount, mergedCount, nil
+}
