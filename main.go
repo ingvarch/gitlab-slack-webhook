@@ -48,7 +48,7 @@ func main() {
 
 	logger.Println("[INFO] Initializing Gitlab-Slack integration service...")
 
-	slackClient = slack.New(slackToken)
+	slackClient = slack.New(slackToken, slack.OptionDebug(true))
 
 	checkBotPermissions()
 
@@ -144,6 +144,7 @@ func handleMergeRequest(data map[string]interface{}) {
 		return
 	}
 	author, _ := user["name"].(string)
+	authorEmail, _ := user["email"].(string)
 
 	logger.Printf("[INFO] Processing MR #%d (global ID: %d), action: %s", int(mrID), int(globalMRID), action)
 
@@ -192,7 +193,13 @@ func handleMergeRequest(data map[string]interface{}) {
 				message = fmt.Sprintf("Marked as READY by %s", author)
 			}
 		case "approved":
-			message = fmt.Sprintf("Approved by %s", author)
+			slackUserID, err := getSlackUserIDByEmail(authorEmail)
+			if err != nil {
+				logger.Printf("[WARN] Could not find Slack user for email %s: %v", authorEmail, err)
+				message = fmt.Sprintf("Approved by %s", author)
+			} else {
+				message = fmt.Sprintf("Approved by <@%s>", slackUserID)
+			}
 		}
 	}
 
@@ -347,4 +354,12 @@ func addReaction(threadTS, reaction string) {
 	} else {
 		logger.Printf("[INFO] Successfully added reaction %s to message %s", reaction, threadTS)
 	}
+}
+
+func getSlackUserIDByEmail(email string) (string, error) {
+	user, err := slackClient.GetUserByEmail(email)
+	if err != nil {
+		return "", err
+	}
+	return user.ID, nil
 }
