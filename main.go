@@ -193,6 +193,7 @@ func handleMergeRequest(data map[string]interface{}) {
 	globalMRID, _ := objectAttrs["id"].(float64)
 	title, _ := objectAttrs["title"].(string)
 	url, _ := objectAttrs["url"].(string)
+	description, _ := objectAttrs["description"].(string)
 	user, ok := data["user"].(map[string]interface{})
 	if !ok {
 		logger.Println("[ERROR] Invalid user data in merge request payload")
@@ -209,17 +210,16 @@ func handleMergeRequest(data map[string]interface{}) {
 	}
 
 	if !threadFound {
-		threadTS, err = sendInitialSlackMessage(author, url, int(globalMRID), title)
+		threadTS, err = sendInitialSlackMessage(author, url, int(globalMRID), title, description)
 		if err != nil {
 			logger.Printf("[ERROR] Error sending initial Slack message: %v", err)
 			return
 		}
+		return // Don't send additional messages for new threads
 	}
 
 	var message string
 	switch action {
-	case "open":
-		message = fmt.Sprintf("Merge request opened by %s", author)
 	case "close":
 		message = fmt.Sprintf("Merge request closed by %s", author)
 	case "merge":
@@ -229,37 +229,37 @@ func handleMergeRequest(data map[string]interface{}) {
 	case "update":
 		message = fmt.Sprintf("Merge request updated by %s", author)
 	case "approved":
+		err = updateParentMessageWithApproval(threadTS, author)
+		if err != nil {
+			logger.Printf("[ERROR] Error updating parent Slack message: %v", err)
+		}
+
+		// Getting info about MR author and notifying him
 		projectID, _ := data["project"].(map[string]interface{})["id"].(float64)
-		logger.Printf("[INFO] Attempting to get MR info for project ID %d, MR ID %d", int(projectID), int(mrID))
 		mrInfo, err := getGitLabMRInfo(int(projectID), int(mrID))
 		if err != nil {
 			logger.Printf("[ERROR] Could not get MR info from GitLab: %v", err)
-			message = fmt.Sprintf("Merge request approved by %s", author)
 		} else {
-			logger.Printf("[INFO] Successfully retrieved MR info. Author username: %s, email: %s", mrInfo.Author.Username, mrInfo.Author.Email)
 			slackUserID, err := getSlackUserIDByGitLabInfo(mrInfo.Author.Username, mrInfo.Author.Email)
 			if err != nil {
 				logger.Printf("[WARN] Could not find Slack user for GitLab user %s: %v", mrInfo.Author.Username, err)
-				message = fmt.Sprintf("Merge request approved by %s", author)
 			} else {
-				logger.Printf("[INFO] Found Slack user ID for GitLab user %s: %s", mrInfo.Author.Username, slackUserID)
-				message = fmt.Sprintf("Approved by %s. Hey <@%s>, your MR is ready to merge!", author, slackUserID)
-				err = updateParentMessageWithApproval(threadTS, author)
-				if err != nil {
-					logger.Printf("[ERROR] Error updating parent Slack message: %v", err)
-					return
-				}
+				message = fmt.Sprintf("Hey <@%s>, your MR is ready to merge!", slackUserID)
 			}
+		}
+	case "unapproved":
+		message = fmt.Sprintf("Approval revoked by %s", author)
+		err = updateParentMessageRemoveApproval(threadTS, author)
+		if err != nil {
+			logger.Printf("[ERROR] Error updating parent Slack message: %v", err)
 		}
 	}
 
-	err = sendThreadMessage(message, threadTS)
-	if err != nil {
-		logger.Printf("[ERROR] Error sending thread message: %v", err)
-	}
-
-	if action == "approved" {
-		addReaction(threadTS, "white_check_mark")
+	if message != "" {
+		err = sendThreadMessage(message, threadTS)
+		if err != nil {
+			logger.Printf("[ERROR] Error sending thread message: %v", err)
+		}
 	}
 }
 
@@ -303,18 +303,6 @@ func findOrCreateThreadTS(globalMRID int) (string, bool, error) {
 
 	logger.Printf("[INFO] Thread for MR with global ID %d not found", globalMRID)
 	return "", false, nil
-}
-
-func addReaction(threadTS, reaction string) {
-	err := slackClient.AddReaction(reaction, slack.ItemRef{
-		Channel:   channelID,
-		Timestamp: threadTS,
-	})
-	if err != nil {
-		logger.Printf("[ERROR] Error adding reaction: %v", err)
-	} else {
-		logger.Printf("[INFO] Successfully added reaction %s to message %s", reaction, threadTS)
-	}
 }
 
 func getSlackUserIDByEmail(email string) (string, error) {
@@ -446,18 +434,27 @@ func sendThreadMessage(message, threadTS string) error {
 	return nil
 }
 
-func sendInitialSlackMessage(author, url string, mrID int, title string) (string, error) {
+func sendInitialSlackMessage(author, url string, mrID int, title, description string) (string, error) {
 	blocks := []slack.Block{
 		slack.NewSectionBlock(&slack.TextBlockObject{
 			Type: slack.MarkdownType,
-			Text: fmt.Sprintf("Merge request open by %s", author),
+			Text: fmt.Sprintf("Merge request opened by %s", author),
 		}, nil, nil),
 		slack.NewDividerBlock(),
 		slack.NewSectionBlock(&slack.TextBlockObject{
 			Type: slack.MarkdownType,
 			Text: fmt.Sprintf("<%s|#%d %s>", url, mrID, title),
 		}, nil, nil),
-		slack.NewDividerBlock(),
+	}
+
+	if description != "" {
+		blocks = append(blocks,
+			slack.NewDividerBlock(),
+			slack.NewSectionBlock(&slack.TextBlockObject{
+				Type: slack.MarkdownType,
+				Text: fmt.Sprintf("Description:\n%s", description),
+			}, nil, nil),
+		)
 	}
 
 	msgOptions := []slack.MsgOption{
@@ -474,7 +471,6 @@ func sendInitialSlackMessage(author, url string, mrID int, title string) (string
 }
 
 func updateParentMessageWithApproval(threadTS string, author string) error {
-	// Retrieve the original message to preserve existing blocks
 	historyParams := &slack.GetConversationHistoryParameters{
 		ChannelID: channelID,
 		Inclusive: true,
@@ -493,13 +489,30 @@ func updateParentMessageWithApproval(threadTS string, author string) error {
 	}
 
 	originalMessage := history.Messages[0]
-
-	// Append the approval context block to the existing blocks
-	approvalContextBlock := slack.NewContextBlock("context", slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("*%s* has approved this message.", author), false, false), slack.NewTextBlockObject("plain_text", ":white_check_mark:", false, false))
 	originalBlocks := originalMessage.Blocks.BlockSet
-	originalBlocks = append(originalBlocks, approvalContextBlock)
 
-	// Update the message with new blocks
+	// Check if approval block already exists
+	approvalBlockIndex := -1
+	for i, block := range originalBlocks {
+		if block.BlockType() == slack.MBTContext {
+			approvalBlockIndex = i
+			break
+		}
+	}
+
+	approvalText := fmt.Sprintf(":white_check_mark: Approved by %s", author)
+	if approvalBlockIndex != -1 {
+		// Update existing approval block
+		contextBlock := originalBlocks[approvalBlockIndex].(*slack.ContextBlock)
+		existingText := contextBlock.ContextElements.Elements[0].(*slack.TextBlockObject).Text
+		updatedText := existingText + ", " + author
+		contextBlock.ContextElements.Elements[0] = slack.NewTextBlockObject("mrkdwn", updatedText, false, false)
+	} else {
+		// Add new approval block
+		approvalContextBlock := slack.NewContextBlock("approval_context", slack.NewTextBlockObject("mrkdwn", approvalText, false, false))
+		originalBlocks = append(originalBlocks, approvalContextBlock)
+	}
+
 	return updateSlackMessage("", threadTS, originalBlocks)
 }
 
@@ -516,4 +529,42 @@ func updateSlackMessage(message, threadTS string, blocks []slack.Block) error {
 	}
 	logger.Printf("[INFO] Successfully updated message in Slack. Timestamp: %s", threadTS)
 	return nil
+}
+
+func updateParentMessageRemoveApproval(threadTS string, author string) error {
+	historyParams := &slack.GetConversationHistoryParameters{
+		ChannelID: channelID,
+		Inclusive: true,
+		Latest:    threadTS,
+		Limit:     1,
+	}
+
+	history, err := slackClient.GetConversationHistory(historyParams)
+	if err != nil {
+		logger.Printf("[ERROR] Failed to retrieve message history: %v", err)
+		return err
+	}
+
+	if len(history.Messages) != 1 {
+		return fmt.Errorf("failed to retrieve the original message")
+	}
+
+	originalMessage := history.Messages[0]
+	originalBlocks := originalMessage.Blocks.BlockSet
+
+	// Find and remove approval block
+	approvalBlockIndex := -1
+	for i, block := range originalBlocks {
+		if block.BlockType() == slack.MBTContext {
+			approvalBlockIndex = i
+			break
+		}
+	}
+
+	if approvalBlockIndex != -1 {
+		// Remove approval block
+		originalBlocks = append(originalBlocks[:approvalBlockIndex], originalBlocks[approvalBlockIndex+1:]...)
+	}
+
+	return updateSlackMessage("", threadTS, originalBlocks)
 }
