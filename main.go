@@ -1,8 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 
@@ -11,17 +15,69 @@ import (
 )
 
 var (
-	slackClient *slack.Client
-	channelID   string
-	gitlabToken string
-	port        string
-	logger      *log.Logger
+	slackClient    *slack.Client
+	channelID      string
+	gitlabToken    string
+	port           string
+	logger         *log.Logger
+	gitlabAPIToken string
 )
+
+type GitLabMRInfo struct {
+	Author struct {
+		Username string `json:"username"`
+		Email    string `json:"email"`
+	} `json:"author"`
+}
+
+func getGitLabMRInfo(projectID int, mrIID int) (*GitLabMRInfo, error) {
+	url := fmt.Sprintf("https://gitlab.com/api/v4/projects/%d/merge_requests/%d", projectID, mrIID)
+	logger.Printf("[INFO] Requesting GitLab MR info: %s", url)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %v", err)
+	}
+
+	req.Header.Set("PRIVATE-TOKEN", gitlabAPIToken)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error making request: %v", err)
+	}
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+
+		}
+	}(resp.Body)
+
+	logger.Printf("[INFO] GitLab API response status: %s", resp.Status)
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	var mrInfo GitLabMRInfo
+	if err := json.NewDecoder(resp.Body).Decode(&mrInfo); err != nil {
+		return nil, fmt.Errorf("error decoding response: %v", err)
+	}
+
+	logger.Printf("[INFO] GitLab MR info retrieved successfully. Author username: %s, email: %s", mrInfo.Author.Username, mrInfo.Author.Email)
+
+	return &mrInfo, nil
+}
 
 func main() {
 	slackToken := os.Getenv("SLACK_BOT_TOKEN")
 	channelID = os.Getenv("SLACK_CHANNEL_ID")
 	gitlabToken = os.Getenv("GITLAB_SECRET_TOKEN")
+	gitlabAPIToken = os.Getenv("GITLAB_API_TOKEN")
+	if gitlabAPIToken == "" {
+		log.Fatalf("[ERROR] GITLAB_API_TOKEN must be set")
+	}
 	port = os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -144,7 +200,6 @@ func handleMergeRequest(data map[string]interface{}) {
 		return
 	}
 	author, _ := user["name"].(string)
-	authorEmail, _ := user["email"].(string)
 
 	logger.Printf("[INFO] Processing MR #%d (global ID: %d), action: %s", int(mrID), int(globalMRID), action)
 
@@ -156,30 +211,11 @@ func handleMergeRequest(data map[string]interface{}) {
 
 	var message string
 	if !threadFound {
-		message = fmt.Sprintf("[#%d] Merge request update: <%s|%s> by %s\n%s\n", int(globalMRID), url, title, author, url)
-		switch action {
-		case "open":
-			message += "New merge request opened"
-		case "close":
-			message += "Merge request closed"
-		case "merge":
-			message += "Merge request merged"
-		case "reopen":
-			message += "Merge request reopened"
-		case "update":
-			if workInProgress {
-				message += "Marked as DRAFT"
-			} else {
-				message += "Marked as READY"
-			}
-		case "approved":
-			message += "Merge request approved"
-		}
-		message += fmt.Sprintf(" by %s", author)
+		message = fmt.Sprintf("Merge request %s by %s: [#%d] <%s|%s>\n", action, author, int(globalMRID), url, title)
 	} else {
 		switch action {
 		case "open":
-			message = fmt.Sprintf("New merge request opened by %s", author)
+			message = fmt.Sprintf("Merge request opened by %s", author)
 		case "close":
 			message = fmt.Sprintf("Closed by %s", author)
 		case "merge":
@@ -193,12 +229,22 @@ func handleMergeRequest(data map[string]interface{}) {
 				message = fmt.Sprintf("Marked as READY by %s", author)
 			}
 		case "approved":
-			slackUserID, err := getSlackUserIDByEmail(authorEmail)
+			projectID, _ := data["project"].(map[string]interface{})["id"].(float64)
+			logger.Printf("[INFO] Attempting to get MR info for project ID %d, MR ID %d", int(projectID), int(mrID))
+			mrInfo, err := getGitLabMRInfo(int(projectID), int(mrID))
 			if err != nil {
-				logger.Printf("[WARN] Could not find Slack user for email %s: %v", authorEmail, err)
-				message = fmt.Sprintf("Approved by %s", author)
+				logger.Printf("[ERROR] Could not get MR info from GitLab: %v", err)
+				message = fmt.Sprintf("Merge request approved by %s", author)
 			} else {
-				message = fmt.Sprintf("Approved by <@%s>", slackUserID)
+				logger.Printf("[INFO] Successfully retrieved MR info. Author username: %s, email: %s", mrInfo.Author.Username, mrInfo.Author.Email)
+				slackUserID, err := getSlackUserIDByGitLabInfo(mrInfo.Author.Username, mrInfo.Author.Email)
+				if err != nil {
+					logger.Printf("[WARN] Could not find Slack user for GitLab user %s: %v", mrInfo.Author.Username, err)
+					message = fmt.Sprintf("Merge request approved by %s", author)
+				} else {
+					logger.Printf("[INFO] Found Slack user ID for GitLab user %s: %s", mrInfo.Author.Username, slackUserID)
+					message = fmt.Sprintf("Approved by %s. Hey <@%s>, your MR is ready to merge!", author, slackUserID)
+				}
 			}
 		}
 	}
@@ -206,6 +252,8 @@ func handleMergeRequest(data map[string]interface{}) {
 	newThreadTS, err := sendSlackMessage(message, threadTS)
 	if err != nil {
 		logger.Printf("[ERROR] Error sending Slack message: %v", err)
+	} else {
+		logger.Printf("[INFO] Successfully sent message to Slack. Timestamp: %s", newThreadTS)
 	}
 
 	if !threadFound {
@@ -357,9 +405,72 @@ func addReaction(threadTS, reaction string) {
 }
 
 func getSlackUserIDByEmail(email string) (string, error) {
+	logger.Printf("[INFO] Attempting to get Slack user ID for email: %s", email)
 	user, err := slackClient.GetUserByEmail(email)
 	if err != nil {
+		logger.Printf("[WARN] Error getting user by email: %v", err)
+		if err.Error() == "users_not_found" {
+			logger.Printf("[INFO] User not found by email, trying to find user by iterating through all users")
+			users, err := slackClient.GetUsers()
+			if err != nil {
+				logger.Printf("[ERROR] Error getting Slack users: %v", err)
+				return "", fmt.Errorf("error getting Slack users: %v", err)
+			}
+			for _, u := range users {
+				logger.Printf("[DEBUG] Checking user: %s, email: %s", u.Name, u.Profile.Email)
+				if u.Profile.Email == email {
+					logger.Printf("[INFO] Found matching user: %s", u.ID)
+					return u.ID, nil
+				}
+			}
+			logger.Printf("[WARN] No matching user found after checking all users")
+		}
 		return "", err
 	}
+	logger.Printf("[INFO] Successfully found Slack user ID: %s", user.ID)
 	return user.ID, nil
+}
+
+func getSlackUserIDByGitLabInfo(gitlabUsername, gitlabEmail string) (string, error) {
+	logger.Printf("[INFO] Attempting to get Slack user ID for GitLab username: %s, email: %s", gitlabUsername, gitlabEmail)
+
+	if gitlabEmail != "" {
+		userID, err := getSlackUserIDByEmail(gitlabEmail)
+		if err == nil {
+			return userID, nil
+		}
+		logger.Printf("[WARN] Could not find user by email: %v", err)
+	}
+
+	users, err := slackClient.GetUsers()
+	if err != nil {
+		return "", fmt.Errorf("error getting Slack users: %v", err)
+	}
+
+	for _, user := range users {
+		logger.Printf("[DEBUG] Checking user: %s, email: %s, real name: %s, display name: %s",
+			user.Name, user.Profile.Email, user.RealName, user.Profile.DisplayName)
+
+		// Exclude system users and bots
+		if user.IsBot || user.ID == "USLACKBOT" {
+			continue
+		}
+
+		if strings.EqualFold(user.Profile.Email, gitlabEmail) ||
+			strings.EqualFold(user.Name, gitlabUsername) ||
+			strings.EqualFold(user.Profile.DisplayName, gitlabUsername) ||
+			strings.EqualFold(user.RealName, gitlabUsername) {
+			logger.Printf("[INFO] Found exact match for user: %s", user.ID)
+			return user.ID, nil
+		}
+
+		// If there is no exact match, check for partial match
+		if strings.Contains(strings.ToLower(user.RealName), strings.ToLower(gitlabUsername)) ||
+			strings.Contains(strings.ToLower(user.Profile.DisplayName), strings.ToLower(gitlabUsername)) {
+			logger.Printf("[INFO] Found partial match for user: %s", user.ID)
+			return user.ID, nil
+		}
+	}
+
+	return "", fmt.Errorf("no matching Slack user found for GitLab username: %s, email: %s", gitlabUsername, gitlabEmail)
 }
