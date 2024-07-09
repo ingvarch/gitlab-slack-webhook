@@ -193,7 +193,6 @@ func handleMergeRequest(data map[string]interface{}) {
 	globalMRID, _ := objectAttrs["id"].(float64)
 	title, _ := objectAttrs["title"].(string)
 	url, _ := objectAttrs["url"].(string)
-	workInProgress, _ := objectAttrs["work_in_progress"].(bool)
 	user, ok := data["user"].(map[string]interface{})
 	if !ok {
 		logger.Println("[ERROR] Invalid user data in merge request payload")
@@ -209,155 +208,59 @@ func handleMergeRequest(data map[string]interface{}) {
 		return
 	}
 
-	var message string
 	if !threadFound {
-		message = fmt.Sprintf("Merge request %s by %s: [#%d] <%s|%s>\n", action, author, int(globalMRID), url, title)
-	} else {
-		switch action {
-		case "open":
-			message = fmt.Sprintf("Merge request opened by %s", author)
-		case "close":
-			message = fmt.Sprintf("Closed by %s", author)
-		case "merge":
-			message = fmt.Sprintf("Merged by %s", author)
-		case "reopen":
-			message = fmt.Sprintf("Reopened by %s", author)
-		case "update":
-			if workInProgress {
-				message = fmt.Sprintf("Marked as DRAFT by %s", author)
-			} else {
-				message = fmt.Sprintf("Marked as READY by %s", author)
-			}
-		case "approved":
-			projectID, _ := data["project"].(map[string]interface{})["id"].(float64)
-			logger.Printf("[INFO] Attempting to get MR info for project ID %d, MR ID %d", int(projectID), int(mrID))
-			mrInfo, err := getGitLabMRInfo(int(projectID), int(mrID))
+		threadTS, err = sendInitialSlackMessage(author, url, int(globalMRID), title)
+		if err != nil {
+			logger.Printf("[ERROR] Error sending initial Slack message: %v", err)
+			return
+		}
+	}
+
+	var message string
+	switch action {
+	case "open":
+		message = fmt.Sprintf("Merge request opened by %s", author)
+	case "close":
+		message = fmt.Sprintf("Merge request closed by %s", author)
+	case "merge":
+		message = fmt.Sprintf("Merge request merged by %s", author)
+	case "reopen":
+		message = fmt.Sprintf("Merge request reopened by %s", author)
+	case "update":
+		message = fmt.Sprintf("Merge request updated by %s", author)
+	case "approved":
+		projectID, _ := data["project"].(map[string]interface{})["id"].(float64)
+		logger.Printf("[INFO] Attempting to get MR info for project ID %d, MR ID %d", int(projectID), int(mrID))
+		mrInfo, err := getGitLabMRInfo(int(projectID), int(mrID))
+		if err != nil {
+			logger.Printf("[ERROR] Could not get MR info from GitLab: %v", err)
+			message = fmt.Sprintf("Merge request approved by %s", author)
+		} else {
+			logger.Printf("[INFO] Successfully retrieved MR info. Author username: %s, email: %s", mrInfo.Author.Username, mrInfo.Author.Email)
+			slackUserID, err := getSlackUserIDByGitLabInfo(mrInfo.Author.Username, mrInfo.Author.Email)
 			if err != nil {
-				logger.Printf("[ERROR] Could not get MR info from GitLab: %v", err)
+				logger.Printf("[WARN] Could not find Slack user for GitLab user %s: %v", mrInfo.Author.Username, err)
 				message = fmt.Sprintf("Merge request approved by %s", author)
 			} else {
-				logger.Printf("[INFO] Successfully retrieved MR info. Author username: %s, email: %s", mrInfo.Author.Username, mrInfo.Author.Email)
-				slackUserID, err := getSlackUserIDByGitLabInfo(mrInfo.Author.Username, mrInfo.Author.Email)
+				logger.Printf("[INFO] Found Slack user ID for GitLab user %s: %s", mrInfo.Author.Username, slackUserID)
+				message = fmt.Sprintf("Approved by %s. Hey <@%s>, your MR is ready to merge!", author, slackUserID)
+				err = updateParentMessageWithApproval(threadTS, author)
 				if err != nil {
-					logger.Printf("[WARN] Could not find Slack user for GitLab user %s: %v", mrInfo.Author.Username, err)
-					message = fmt.Sprintf("Merge request approved by %s", author)
-				} else {
-					logger.Printf("[INFO] Found Slack user ID for GitLab user %s: %s", mrInfo.Author.Username, slackUserID)
-					message = fmt.Sprintf("Approved by %s. Hey <@%s>, your MR is ready to merge!", author, slackUserID)
+					logger.Printf("[ERROR] Error updating parent Slack message: %v", err)
+					return
 				}
 			}
 		}
 	}
 
-	newThreadTS, err := sendSlackMessage(message, threadTS)
+	err = sendThreadMessage(message, threadTS)
 	if err != nil {
-		logger.Printf("[ERROR] Error sending Slack message: %v", err)
-	} else {
-		logger.Printf("[INFO] Successfully sent message to Slack. Timestamp: %s", newThreadTS)
-	}
-
-	if !threadFound {
-		threadTS = newThreadTS
+		logger.Printf("[ERROR] Error sending thread message: %v", err)
 	}
 
 	if action == "approved" {
 		addReaction(threadTS, "white_check_mark")
 	}
-}
-
-func handleComment(data map[string]interface{}) {
-	objectAttrs, ok := data["object_attributes"].(map[string]interface{})
-	if !ok {
-		logger.Println("[ERROR] Invalid object_attributes in comment payload")
-		return
-	}
-	noteableType, _ := objectAttrs["noteable_type"].(string)
-	if noteableType != "MergeRequest" {
-		logger.Printf("[INFO] Ignoring comment on %s", noteableType)
-		return
-	}
-
-	mergeRequest, ok := data["merge_request"].(map[string]interface{})
-	if !ok {
-		logger.Println("[ERROR] Invalid merge_request data in comment payload")
-		return
-	}
-	mrID, _ := mergeRequest["iid"].(float64)
-	globalMRID, _ := mergeRequest["id"].(float64)
-	title, _ := mergeRequest["title"].(string)
-	url, _ := mergeRequest["url"].(string)
-
-	note, _ := objectAttrs["note"].(string)
-	user, ok := data["user"].(map[string]interface{})
-	if !ok {
-		logger.Println("[ERROR] Invalid user data in comment payload")
-		return
-	}
-	author, _ := user["name"].(string)
-
-	logger.Printf("[INFO] Processing comment on MR #%d (global ID: %d)", int(mrID), int(globalMRID))
-
-	threadTS, threadFound, err := findOrCreateThreadTS(int(globalMRID))
-	if err != nil {
-		logger.Printf("[ERROR] Error finding thread for MR #%d (global ID: %d): %v", int(mrID), int(globalMRID), err)
-		return
-	}
-
-	var message string
-	if !threadFound {
-		message = fmt.Sprintf("[#%d] New comment on merge request: <%s|%s> by %s\n%s\n\n", int(globalMRID), url, title, author, url)
-	}
-
-	position, hasPosition := objectAttrs["position"].(map[string]interface{})
-	if hasPosition {
-		oldPath, _ := position["old_path"].(string)
-		newPath, _ := position["new_path"].(string)
-		oldLine, _ := position["old_line"].(float64)
-		newLine, _ := position["new_line"].(float64)
-
-		project, _ := data["project"].(map[string]interface{})
-		projectURL, _ := project["web_url"].(string)
-		commentID, _ := objectAttrs["id"].(float64)
-		commentURL := fmt.Sprintf("%s/-/merge_requests/%d#note_%d", projectURL, int(mrID), int(commentID))
-
-		commentInfo := fmt.Sprintf("Code comment by %s:\n", author)
-		if oldPath != "" && newPath != "" && oldPath != newPath {
-			commentInfo += fmt.Sprintf("File changed: %s -> %s\n", oldPath, newPath)
-		} else if newPath != "" {
-			commentInfo += fmt.Sprintf("File: %s\n", newPath)
-		}
-		if oldLine > 0 {
-			commentInfo += fmt.Sprintf("Old line: %d\n", int(oldLine))
-		}
-		if newLine > 0 {
-			commentInfo += fmt.Sprintf("Commented line: <%s|%d>\n", commentURL, int(newLine))
-		}
-		commentInfo += fmt.Sprintf("Comment: %s", note)
-		message += commentInfo
-	} else {
-		message += fmt.Sprintf("New comment by %s:\n\n>%s", author, note)
-	}
-
-	_, err = sendSlackMessage(message, threadTS)
-	if err != nil {
-		logger.Printf("[ERROR] Error sending Slack message: %v", err)
-	}
-}
-
-func sendSlackMessage(message, threadTS string) (string, error) {
-	msgOptions := []slack.MsgOption{
-		slack.MsgOptionText(message, false),
-	}
-	if threadTS != "" {
-		msgOptions = append(msgOptions, slack.MsgOptionTS(threadTS))
-	}
-	_, ts, err := slackClient.PostMessage(channelID, msgOptions...)
-	if err != nil {
-		logger.Printf("[ERROR] Error sending Slack message: %v", err)
-		return "", err
-	}
-	logger.Printf("[INFO] Successfully sent message to Slack. Timestamp: %s", ts)
-	return ts, nil
 }
 
 func findOrCreateThreadTS(globalMRID int) (string, bool, error) {
@@ -367,7 +270,7 @@ func findOrCreateThreadTS(globalMRID int) (string, bool, error) {
 		Limit:     1000,
 	}
 
-	searchString := fmt.Sprintf("[#%d]", globalMRID)
+	searchString := fmt.Sprintf("#%d", globalMRID)
 
 	for {
 		history, err := slackClient.GetConversationHistory(&params)
@@ -376,9 +279,19 @@ func findOrCreateThreadTS(globalMRID int) (string, bool, error) {
 		}
 
 		for _, msg := range history.Messages {
+			// Check if the message text contains the search string
 			if strings.Contains(msg.Text, searchString) {
 				logger.Printf("[INFO] Found thread for MR with global ID %d: %s", globalMRID, msg.Timestamp)
 				return msg.Timestamp, true, nil
+			}
+			// Check if any block text contains the search string
+			for _, block := range msg.Blocks.BlockSet {
+				if sectionBlock, ok := block.(*slack.SectionBlock); ok && sectionBlock.Text != nil {
+					if strings.Contains(sectionBlock.Text.Text, searchString) {
+						logger.Printf("[INFO] Found thread for MR with global ID %d: %s", globalMRID, msg.Timestamp)
+						return msg.Timestamp, true, nil
+					}
+				}
 			}
 		}
 
@@ -473,4 +386,134 @@ func getSlackUserIDByGitLabInfo(gitlabUsername, gitlabEmail string) (string, err
 	}
 
 	return "", fmt.Errorf("no matching Slack user found for GitLab username: %s, email: %s", gitlabUsername, gitlabEmail)
+}
+
+func handleComment(data map[string]interface{}) {
+	objectAttrs, ok := data["object_attributes"].(map[string]interface{})
+	if !ok {
+		logger.Println("[ERROR] Invalid object_attributes in comment payload")
+		return
+	}
+	noteableType, _ := objectAttrs["noteable_type"].(string)
+	if noteableType != "MergeRequest" {
+		logger.Printf("[INFO] Ignoring comment on %s", noteableType)
+		return
+	}
+
+	mergeRequest, ok := data["merge_request"].(map[string]interface{})
+	if !ok {
+		logger.Println("[ERROR] Invalid merge_request data in comment payload")
+		return
+	}
+	mrID, _ := mergeRequest["iid"].(float64)
+	globalMRID, _ := mergeRequest["id"].(float64)
+
+	note, _ := objectAttrs["note"].(string)
+	noteURL, _ := objectAttrs["url"].(string)
+
+	logger.Printf("[INFO] Processing comment on MR #%d (global ID: %d)", int(mrID), int(globalMRID))
+
+	threadTS, threadFound, err := findOrCreateThreadTS(int(globalMRID))
+	if err != nil {
+		logger.Printf("[ERROR] Error finding thread for MR #%d (global ID: %d): %v", int(mrID), int(globalMRID), err)
+		return
+	}
+
+	if !threadFound {
+		logger.Printf("[ERROR] Thread not found for MR #%d (global ID: %d)", int(mrID), int(globalMRID))
+		return
+	}
+
+	message := fmt.Sprintf("New comment on merge request: <%s|View comment>\n>%s", noteURL, note)
+
+	err = sendThreadMessage(message, threadTS)
+	if err != nil {
+		logger.Printf("[ERROR] Error sending thread message: %v", err)
+	}
+}
+
+func sendThreadMessage(message, threadTS string) error {
+	msgOptions := []slack.MsgOption{
+		slack.MsgOptionText(message, false),
+		slack.MsgOptionTS(threadTS),
+	}
+	_, _, err := slackClient.PostMessage(channelID, msgOptions...)
+	if err != nil {
+		logger.Printf("[ERROR] Error sending thread Slack message: %v", err)
+		return err
+	}
+	logger.Printf("[INFO] Successfully sent thread message to Slack.")
+	return nil
+}
+
+func sendInitialSlackMessage(author, url string, mrID int, title string) (string, error) {
+	blocks := []slack.Block{
+		slack.NewSectionBlock(&slack.TextBlockObject{
+			Type: slack.MarkdownType,
+			Text: fmt.Sprintf("Merge request open by %s", author),
+		}, nil, nil),
+		slack.NewDividerBlock(),
+		slack.NewSectionBlock(&slack.TextBlockObject{
+			Type: slack.MarkdownType,
+			Text: fmt.Sprintf("<%s|#%d %s>", url, mrID, title),
+		}, nil, nil),
+		slack.NewDividerBlock(),
+	}
+
+	msgOptions := []slack.MsgOption{
+		slack.MsgOptionBlocks(blocks...),
+	}
+
+	_, ts, err := slackClient.PostMessage(channelID, msgOptions...)
+	if err != nil {
+		logger.Printf("[ERROR] Error sending initial Slack message: %v", err)
+		return "", err
+	}
+	logger.Printf("[INFO] Successfully sent initial message to Slack. Timestamp: %s", ts)
+	return ts, nil
+}
+
+func updateParentMessageWithApproval(threadTS string, author string) error {
+	// Retrieve the original message to preserve existing blocks
+	historyParams := &slack.GetConversationHistoryParameters{
+		ChannelID: channelID,
+		Inclusive: true,
+		Latest:    threadTS,
+		Limit:     1,
+	}
+
+	history, err := slackClient.GetConversationHistory(historyParams)
+	if err != nil {
+		logger.Printf("[ERROR] Failed to retrieve message history: %v", err)
+		return err
+	}
+
+	if len(history.Messages) != 1 {
+		return fmt.Errorf("failed to retrieve the original message")
+	}
+
+	originalMessage := history.Messages[0]
+
+	// Append the approval context block to the existing blocks
+	approvalContextBlock := slack.NewContextBlock("context", slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("*%s* has approved this message.", author), false, false), slack.NewTextBlockObject("plain_text", ":white_check_mark:", false, false))
+	originalBlocks := originalMessage.Blocks.BlockSet
+	originalBlocks = append(originalBlocks, approvalContextBlock)
+
+	// Update the message with new blocks
+	return updateSlackMessage("", threadTS, originalBlocks)
+}
+
+func updateSlackMessage(message, threadTS string, blocks []slack.Block) error {
+	msgOptions := []slack.MsgOption{
+		slack.MsgOptionText(message, false),
+		slack.MsgOptionBlocks(blocks...),
+		slack.MsgOptionTS(threadTS),
+	}
+	_, _, _, err := slackClient.UpdateMessage(channelID, threadTS, msgOptions...)
+	if err != nil {
+		logger.Printf("[ERROR] Error updating Slack message: %v", err)
+		return err
+	}
+	logger.Printf("[INFO] Successfully updated message in Slack. Timestamp: %s", threadTS)
+	return nil
 }
