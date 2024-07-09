@@ -31,7 +31,12 @@ type GitLabMRInfo struct {
 }
 
 func getGitLabMRInfo(projectID int, mrIID int) (*GitLabMRInfo, error) {
-	url := fmt.Sprintf("https://gitlab.com/api/v4/projects/%d/merge_requests/%d", projectID, mrIID)
+	baseURL := os.Getenv("GITLAB_BASE_URL")
+	if baseURL == "" {
+		baseURL = "https://gitlab.com" // default GitLab.com URL
+	}
+
+	url := fmt.Sprintf("%s/api/v4/projects/%d/merge_requests/%d", baseURL, projectID, mrIID)
 	logger.Printf("[INFO] Requesting GitLab MR info: %s", url)
 
 	req, err := http.NewRequest("GET", url, nil)
