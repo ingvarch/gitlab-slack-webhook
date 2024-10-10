@@ -14,4 +14,4 @@ linters-settings:
           - github.com/ingvarch/gitlab-slack-webhook
           - github.com/sethvargo/go-envconfig
           - github.com/gofiber/fiber/v2
-
+          - github.com/stretchr/testify/require

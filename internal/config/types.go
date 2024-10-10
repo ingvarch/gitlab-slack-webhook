@@ -15,6 +15,6 @@ type SlackConfig struct {
 }
 
 type GitlabConfig struct {
-	SecretToken bool     `env:"GITLAB_SECRET_TOKEN"`
-	APIToken    []string `env:"GITLAB_API_TOKEN"`
+	SecretToken string `env:"GITLAB_SECRET_TOKEN"`
+	APIToken    string `env:"GITLAB_API_TOKEN"`
 }
