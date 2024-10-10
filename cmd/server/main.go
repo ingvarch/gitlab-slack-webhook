@@ -24,4 +24,7 @@ func main() {
 		slog.Error("Configuration setup:", "error", err)
 		os.Exit(1)
 	}
+
+	slog.Info(cfg.Port)
+	slog.Info("Configuration loaded successfully")
 }
