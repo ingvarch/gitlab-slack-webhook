@@ -3,10 +3,10 @@
 package config
 
 type Config struct {
-	Port string `env:"APP_PORT"`
-
-	Slack  *SlackConfig
-	Gitlab *GitlabConfig
+	Port     string `env:"APP_PORT"`
+	LogLevel string `env:"LOG_LEVEL"`
+	Slack    *SlackConfig
+	Gitlab   *GitlabConfig
 }
 
 type SlackConfig struct {
@@ -16,5 +16,5 @@ type SlackConfig struct {
 
 type GitlabConfig struct {
 	SecretToken bool     `env:"GITLAB_SECRET_TOKEN"`
-	ApiToken    []string `env:"GITLAB_API_TOKEN"`
+	APIToken    []string `env:"GITLAB_API_TOKEN"`
 }

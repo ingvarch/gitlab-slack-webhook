@@ -4,25 +4,29 @@ package config
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 
 	"github.com/sethvargo/go-envconfig"
 )
 
-// checkConfig checks if all required fields are set
-func checkConfig(c interface{}) error {
-	v := reflect.ValueOf(c)
-	if v.Kind() == reflect.Ptr {
-		v = v.Elem()
-	}
-	t := v.Type()
+var ErrEnvNotSet = errors.New("environment variable is not set")
 
-	for i := 0; i < v.NumField(); i++ {
-		field := v.Field(i)
+// CheckConfig checks if all required fields are set.
+func CheckConfig(c interface{}) error {
+	value := reflect.ValueOf(c)
+	if value.Kind() == reflect.Ptr {
+		value = value.Elem()
+	}
+
+	structType := value.Type()
+
+	for fieldIndex := range structType.NumField() {
+		field := value.Field(fieldIndex)
 		fieldType := field.Type()
 		fieldKind := fieldType.Kind()
-		tag := t.Field(i).Tag.Get("env")
+		envTag := structType.Field(fieldIndex).Tag.Get("env")
 
 		if fieldKind == reflect.Ptr {
 			if field.IsNil() {
@@ -30,17 +34,18 @@ func checkConfig(c interface{}) error {
 				field.Set(reflect.New(fieldType.Elem()))
 			}
 			// Recursively check nested structure
-			if err := checkConfig(field.Interface()); err != nil {
+			if err := CheckConfig(field.Interface()); err != nil {
 				return err
 			}
-		} else if tag != "" && fieldKind == reflect.String && field.String() == "" {
-			return fmt.Errorf("environment variable %s is not set", tag)
+		} else if envTag != "" && fieldKind == reflect.String && field.String() == "" {
+			return fmt.Errorf("%w: %s", ErrEnvNotSet, envTag)
 		}
 	}
+
 	return nil
 }
 
-// SetupConfig loads configuration from environment variables
+// SetupConfig loads configuration from environment variables.
 func SetupConfig(ctx context.Context) (*Config, error) {
 	var cfg Config
 
@@ -48,7 +53,7 @@ func SetupConfig(ctx context.Context) (*Config, error) {
 		return nil, fmt.Errorf("failed to process env config: %w", err)
 	}
 
-	if err := checkConfig(&cfg); err != nil {
+	if err := CheckConfig(&cfg); err != nil {
 		return nil, fmt.Errorf("configuration error: %w", err)
 	}
 

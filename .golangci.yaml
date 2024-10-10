@@ -1,0 +1,17 @@
+linters:
+  # Disable all linters.
+  # Default: false
+  disable-all: false
+#  enable:
+#    - depguard
+
+linters-settings:
+  depguard:
+    rules:
+      main:
+        allow:
+          - $gostd
+          - github.com/ingvarch/gitlab-slack-webhook
+          - github.com/sethvargo/go-envconfig
+          - github.com/gofiber/fiber/v2
+
